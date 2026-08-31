@@ -1,39 +1,94 @@
 # LinkedIn Profile API
 
-Accepts a LinkedIn profile URL, returns structured JSON: name, headline, location, about,
-experience, education, skills, certifications, languages, and profile image — reverse-engineered
-via direct HTTP requests, no browser automation.
+Give it a LinkedIn profile URL, get back clean, structured JSON: name, headline, location,
+about, experience, education, skills, certifications, languages, projects, honors & awards,
+recommendations, and photos/logos — built for the Tross Careers Team hiring challenge.
 
-## Setup
+The one hard requirement from the challenge was: **no browser automation in the deployed
+service** — it has to be a direct HTTP client that talks to LinkedIn the way a real browser
+does, not a Chrome instance driven by code. That constraint is what most of this project's
+engineering effort went into satisfying.
+
+## How it works, in plain terms
+
+A LinkedIn profile page isn't one request — it's built out of two different kinds of
+requests, and we talk to both directly:
+
+```mermaid
+flowchart LR
+    U["You / your frontend"] -->|"POST /profile<br/>{ profile_url }"| API["This API<br/>(FastAPI)"]
+    API -->|"cookie only"| P1["Profile page & Experience<br/>(plain server-rendered HTML)"]
+    API -->|"cookie + CSRF token<br/>(no fingerprinting)"| P2["Education, Skills, Projects,<br/>Honors, Certifications, Languages,<br/>Recommendations (bundled data calls)"]
+    P1 --> LI[("linkedin.com")]
+    P2 --> LI
+    API -->|"structured JSON"| U
+```
+
+- **The main profile page and Experience** are plain, server-rendered HTML — the same page
+  you'd see in your browser. A logged-in session cookie is all that's needed.
+- **Everything else** (Education, Skills, Projects, Honors & Awards, Certifications,
+  Languages, Recommendations) loads through the same background data calls the LinkedIn
+  website itself makes after the page loads. We reverse-engineered those calls and replicate
+  them with the same login the browser already has — a session cookie plus a CSRF token
+  (standard, not a bot-detection bypass) — no fingerprint spoofing, no stealth tricks, no
+  headless browser anywhere in the request path.
+
+We also tried the "just drive a real browser" approach first — it's the obvious shortcut,
+and several public LinkedIn scrapers do exactly that. We ended up ruling it out (LinkedIn
+revokes the session within 1–2 automated page loads, even with a persistent browser profile
+and slow, human-like pacing) and instead reverse-engineered the direct requests instead. The
+full story, with actual captured requests and every dead end, is in
+[`docs/FINDINGS.md`](docs/FINDINGS.md) for anyone who wants the evidence trail.
+
+### Not making you wait on one long request
+
+A cold (uncached) profile fetch makes close enough to a dozen paced requests to LinkedIn
+that it can take 20–40 seconds. Rather than holding your connection open that whole time
+(and risking a timeout), there's an async job pattern with a live progress log:
+
+```mermaid
+sequenceDiagram
+    participant You
+    participant API
+    participant LinkedIn
+
+    You->>API: POST /profile/async
+    API-->>You: job_id (instantly)
+    loop every ~1.2s
+        You->>API: GET /profile/status/{job_id}
+        API-->>You: progress log so far
+        API->>LinkedIn: (fetching in the background, paced)
+    end
+    API-->>You: status: done + full result
+```
+
+The built-in web UI (see below) already uses this and shows the log live, terminal-style. A
+plain synchronous `POST /profile` is still available too, for simplicity or for automated
+grading that expects one call in, one JSON blob out.
+
+## Quick start
+
+**Option A — Docker (recommended, zero local Python setup):**
+
+```bash
+cd direct-api
+cp .env.example .env   # then paste your li_at into it (see "Auth" below)
+cd ..
+docker compose up --build
+```
+
+Open **http://localhost:9001/** (also served on `:9002` — same app, two ports).
+
+**Option B — run it directly:**
 
 ```bash
 cd direct-api
 pip install -r requirements.txt
-```
-
-You need your own LinkedIn `li_at` session cookie (DevTools → Application → Cookies →
-`linkedin.com` → `li_at`). Set it as an environment variable — never commit it, never pass it on
-the command line where it could land in shell history:
-
-```bash
-export LI_AT="your_li_at_value_here"
-```
-
-or create `direct-api/.env` (gitignored) with `LI_AT=your_li_at_value_here` and load it before
-running (`set -a && source .env && set +a`).
-
-## Running the API
-
-```bash
-cd direct-api
+export LI_AT="your_li_at_value_here"      # see "Auth" below
 uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
-Then open **http://localhost:8000/** for a small web UI — paste a profile URL, nothing
-else. Credentials are never entered in the browser; the server reads `LI_AT` from its own
-environment.
-
-Or call the API directly:
+Open **http://localhost:8000/** for the web UI, or call the API directly:
 
 ```bash
 curl -X POST http://localhost:8000/profile \
@@ -41,108 +96,71 @@ curl -X POST http://localhost:8000/profile \
   -d '{"profile_url": "https://www.linkedin.com/in/example/"}'
 ```
 
-`GET /health` returns `{"status": "ok"}` for liveness checks.
+### Auth
 
-## API documentation
+The only credential this needs is your own LinkedIn session cookie, `li_at` (DevTools →
+Application → Cookies → linkedin.com → `li_at`). It's read from the `LI_AT` environment
+variable on the server only — the frontend never asks for it, it's never logged, and it's
+never committed (see `.gitignore`).
 
-### `POST /profile`
+## API reference
 
-**Request body**
+| Endpoint | What it does |
+|---|---|
+| `POST /profile` | Synchronous — blocks until the profile is fetched, returns the full JSON directly. |
+| `POST /profile/async` | Returns a `job_id` immediately; use this if you don't want to hold a request open. |
+| `GET /profile/status/{job_id}` | Poll for progress/result — `{"status": "pending" \| "done" \| "error", "log": [...], "result": {...}}`. |
+| `GET /health` | Liveness check. |
+
+**Request** (both `/profile` and `/profile/async`):
 ```json
 { "profile_url": "https://www.linkedin.com/in/example/" }
 ```
 
-**Response** (`200`)
+**Result shape:**
 ```json
 {
-  "profile": {
-    "url": "...", "name": "...", "headline": "...", "location": "...",
-    "about": "...", "image_url": "...", "connection_degree": "1st",
-    "current_company_school_summary": "..."
-  },
-  "experience": [
-    { "title": "...", "company": "...", "date_range": "...", "location": "...",
-      "skills": "...", "logo_url": null, "skills_overlay_path": "..." }
-  ],
-  "education": [], "skills": [], "certifications": [], "languages": [],
-  "projects": [], "honors_awards": [], "recommendations": [],
+  "profile": { "name": "...", "headline": "...", "location": "...", "about": "...", "image_url": "..." },
+  "experience": [ { "title": "...", "company": "...", "date_range": "...", "logo_url": "..." } ],
+  "education": [ { "institution": "...", "degree": "...", "date_range": "...", "logo_url": "..." } ],
+  "skills": [ { "name": "...", "details": ["..."] } ],
+  "projects": [ { "name": "...", "description": "...", "thumbnail_url": "..." } ],
+  "honors_awards": [ { "title": "...", "issuer": "...", "date": "..." } ],
+  "certifications": [], "languages": [], "recommendations": [],
   "_meta": { "fetch_status": { "profile": 200, "experience": 200, "...": "..." } }
 }
 ```
 
-`_meta.fetch_status` reports the real HTTP status per section fetched, so a caller can tell
-"genuinely empty on this profile" apart from "blocked" (see Known Limitations).
+`_meta.fetch_status` reports the real HTTP status behind every section, so a caller can tell
+"genuinely empty on this profile" apart from "something failed" — nothing is ever silently
+faked.
 
-**Errors**
+Requests are rate-limited (10/minute/IP by default) and cached in memory per profile URL
+(1 hour by default) so re-fetching the same profile is instant.
 
-| Status | Meaning |
-|---|---|
-| `400` | `profile_url` isn't a valid `linkedin.com/in/{slug}/` URL |
-| `429` | Rate limit exceeded (10 requests/minute per IP, configurable via `RATE_LIMIT_PER_MINUTE`) |
-| `502` | Fetch or parse failure for reasons other than session revocation |
-| `503` | Server misconfigured (`LI_AT` not set) **or** the LinkedIn session has been revoked and needs a fresh `li_at` (see Known Limitations) |
+## What's solid, what to know before relying on it
 
-Responses are cached in-memory per `profile_url` for `CACHE_TTL_SECONDS` (default 3600s).
+- **Base profile and Experience** are the most battle-tested — validated against real,
+  multi-entry captured data.
+- **Education, Skills, Projects, and Honors & Awards** are confirmed working the same
+  no-browser way, including real photos/logos where LinkedIn provides them. Which exact
+  background data call carries which section is *discovered per profile* rather than
+  hardcoded, since it isn't the same for every profile.
+- **Certifications, Languages, and Recommendations** use the same mechanism and correctly
+  report when a profile genuinely has none — but we haven't yet validated them against a
+  profile that actually has populated data in those specific sections, so treat them as
+  "should work" rather than "proven" until confirmed against a real example.
+- **Posts/recent activity** were investigated and the routes tried didn't resolve
+  correctly — not included in the output rather than returning something unreliable.
+- **The session cookie can expire or get revoked** by LinkedIn independent of anything
+  this service does; the API returns a clear `503` when that happens rather than a
+  confusing failure, but recovering it currently needs a human to supply a fresh `li_at`.
+- **Caching, rate-limiting, and job tracking are all in-memory**, scoped to a single
+  running instance — fine for this deployment, would need a shared store (e.g. Redis) to
+  scale across multiple instances.
+- Using this against LinkedIn profiles you don't own, at any real scale, runs into
+  LinkedIn's own terms of use around automated data collection — this project doesn't
+  attempt to address that; it's on whoever operates it to stay within bounds.
 
-## Approach
-
-Everything is documented, with the actual evidence (captured HTML, exact HTTP responses,
-step-by-step reasoning) in [`docs/FINDINGS.md`](docs/FINDINGS.md). Summary:
-
-LinkedIn's web client has two distinct surfaces:
-
-1. **Plain server-rendered page routes** (`/in/{slug}/`, `/in/{slug}/details/experience/`) — real
-   HTML, reachable with just the `li_at` session cookie, no other headers required. This is what
-   `direct-api/extractor.py` uses.
-2. **An internal SPA action API** (`flagship-web/rsc-action/actions/*`, including the pagination
-   endpoint that loads Education/Skills/Projects/Honors/Certifications) — gated behind a battery
-   of client-fingerprint headers (`x-li-track` and others) that only a genuine, undisguised
-   browser instance can produce. Confirmed directly: replaying a real DevTools-captured request
-   worked; three separate attempts using only legitimate auth (cookie, then a properly-derived
-   CSRF token, then static non-fingerprint headers) all failed. This is a closed, evidenced
-   finding, not a guess.
-
-Two real bugs were found and fixed by testing against live responses rather than assuming: (1)
-`requests` mis-decodes LinkedIn's response as Latin-1 instead of UTF-8, corrupting non-ASCII
-characters; (2) reusing one `requests.Session` across fetches accumulates LinkedIn's own
-`Set-Cookie` values, which degrades subsequent responses to a lighter, content-missing variant —
-fixed by resetting the cookie jar to just `li_at` before every request.
-
-A Playwright-based (real browser) approach was also built and tested (`playwright-scraper/`,
-now inactive) specifically to reach the fingerprint-gated sections. It was abandoned: a
-Playwright-driven browser gets its session revoked by LinkedIn's server within 1-2 page loads,
-confirmed reproducible even with a persistent browser profile (accumulated real history/cache
-across runs, not a fresh throwaway one) and slower request pacing. Worse, once triggered, the
-same session then fails for the direct-HTTP client too — it's a session/account-level response,
-not scoped to whichever client triggered it. The remaining fix would be disguising the browser as
-non-automated (patching `navigator.webdriver`, stealth plugins, synthetic human-like timing),
-which is the same category of anti-bot evasion already ruled out for the fingerprint headers,
-just at a different layer. Declined for the same reason.
-
-## Known limitations
-
-- **Education, Skills, Projects, Honors & Awards, and Certifications-when-populated are not
-  currently extractable.** They come back as empty arrays, honestly reflected in
-  `_meta.fetch_status`, not fabricated. This is a confirmed architectural limitation (see
-  Approach above and `docs/FINDINGS.md`), not a bug to be fixed with more parsing logic — the
-  data genuinely isn't reachable via direct HTTP without reproducing browser-fingerprint
-  scoring, which this project treats as out of scope.
-- **Full ("+N more") skill lists** on Experience/Education entries are truncated in what direct
-  HTTP can reach; the full list lives behind the same fingerprint-gated surface above.
-  `skills_overlay_path` is captured in the output for reference even though it can't currently
-  be auto-resolved.
-- **Company/school logo URLs** are not present in the direct-HTTP response body at all for
-  Experience entries (confirmed by checking); `logo_url` will be `null` in practice.
-- **The `li_at` session can be revoked by LinkedIn** under load or anomalous request patterns,
-  independent of which client (this API or the abandoned browser-based one) triggers it. The API
-  surfaces this as a clear `503` rather than crashing, but recovering requires an operator to
-  manually supply a fresh `li_at`. There is no automatic re-authentication.
-- **Rate limiting and caching are in-memory only** — reset on restart, not shared across multiple
-  instances of the service. Fine for a single-process deployment; would need a shared store
-  (Redis, etc.) for real horizontal scaling.
-- **Posts/activity** (`/recent-activity/...`) was investigated and found not to resolve
-  correctly with the routes tried; not included in the output.
-- Deploying to serve **arbitrary third-party profiles** at scale would need addressing all of the
-  above plus LinkedIn's terms of use, which restrict automated data collection — this project
-  treats that as the requester's responsibility to evaluate for their use case, not something
-  addressed by the code itself.
+Full technical evidence — every request tested, every bug found and fixed, and why the
+browser-automation approach was ruled out — lives in [`docs/FINDINGS.md`](docs/FINDINGS.md).
