@@ -1,0 +1,14 @@
+services:
+  linkedin-profile-api:
+    build: ./direct-api
+    env_file:
+      - ./direct-api/.env
+    environment:
+      - CACHE_TTL_SECONDS=${CACHE_TTL_SECONDS:-3600}
+      - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE:-10}
+      - JOB_TTL_SECONDS=${JOB_TTL_SECONDS:-600}
+      - EXTRACTOR_REQUEST_DELAY=${EXTRACTOR_REQUEST_DELAY:-2.0}
+    ports:
+      - "9001:8000"
+      - "9002:8000"
+    restart: unless-stopped

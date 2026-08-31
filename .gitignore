@@ -1,0 +1,6 @@
+.env
+*.env
+__pycache__/
+*.pyc
+/tmp/
+playwright-scraper/.browser_profile/
