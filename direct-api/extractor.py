@@ -157,7 +157,7 @@ class LinkedInSession:
             )     
         if not jsessionid:
             return None
-        return jsessionid, jsessionid.strip('"'Í)
+        return jsessionid, jsessionid.strip('"')
 
     def post_component(self, slug, component_id, jsessionid_raw, csrf_token, timeout=15):
         """POST to `actions/component`, cookie + CSRF only -- no x-li-track or any other
