@@ -160,16 +160,36 @@ class LinkedInSession:
         )
         return resp.status_code, resp.text if resp.status_code == 200 else None
 
-    def get_csrf_token(self, timeout=15):
+    def get_csrf_token(self, slug=None, timeout=15):
         """Derive a csrf-token via the standard double-submit-cookie pattern: the
         CSRF header is just the JSESSIONID cookie value with its surrounding quotes
-        stripped. JSESSIONID is captured as a byproduct of get_html() page-route
-        requests (see there for why a dedicated /feed/ request is unreliable) --
-        this only falls back to a dedicated /feed/ request if no page route has
-        set one yet (e.g. if this is ever called before any get_html() call)."""
+        stripped.
+
+        Which page route actually sets JSESSIONID isn't fixed -- live debug capture
+        showed /in/{slug}/ and /in/{slug}/details/experience/ NOT setting it while
+        /in/{slug}/recent-activity/shares/ did, in one observed run (see
+        docs/FINDINGS.md). Rather than betting on one specific route or a fixed call
+        order elsewhere in the pipeline, this: (1) reuses a JSESSIONID already
+        captured as a byproduct of any earlier get_html() call this session, (2) if
+        none yet, actively probes a short list of known-good page routes in turn and
+        stops at the first one that sets it, (3) only as a last resort falls back to
+        a dedicated /feed/ request (confirmed on its own to come back with only
+        edge/CDN cookies -- __cf_bm, bcookie, lidc -- and no JSESSIONID)."""
         if self._jsessionid:
-            _log("CSRF token reused from a prior page-route request (no /feed/ hit needed)")
+            _log("CSRF token reused from an earlier request this session")
             return self._jsessionid, self._jsessionid.strip('"')
+
+        if slug:
+            for path in (
+                f"/in/{slug}/recent-activity/shares/",
+                f"/in/{slug}/details/experience/",
+                f"/in/{slug}/",
+            ):
+                _pace()
+                self.get_html(path, timeout=timeout)  # captures JSESSIONID as a byproduct
+                if self._jsessionid:
+                    _log(f"CSRF token derived from probing {path}")
+                    return self._jsessionid, self._jsessionid.strip('"')
 
         self.session.cookies.clear()
         self.session.cookies.set("li_at", self._li_at, domain=".linkedin.com")
@@ -304,7 +324,7 @@ def fetch_bundled_sections(session, slug, profile_html, on_progress=None):
         if on_progress:
             on_progress(msg)
 
-    csrf = session.get_csrf_token()
+    csrf = session.get_csrf_token(slug=slug)
     fetch_status = {}
     if not csrf:
         progress("Could not derive a CSRF token — session may be dead")
@@ -1020,6 +1040,19 @@ def extract_profile(profile_url, li_at, on_progress=None):
     else:
         progress(f"Experience fetch failed (HTTP {status})")
 
+    # Fetch recent posts BEFORE the bundled-sections/CSRF step below. Live debug capture
+    # (see docs/FINDINGS.md) showed /in/{slug}/ and /in/{slug}/details/experience/ never
+    # set a JSESSIONID cookie, but /in/{slug}/recent-activity/shares/ reliably does --
+    # so this needs to run first to have a JSESSIONID ready for get_csrf_token() to reuse
+    # (see LinkedInSession.get_html/get_csrf_token) instead of falling back to the
+    # unreliable dedicated /feed/ request.
+    _pace()
+    progress("Fetching recent posts…")
+    posts_status, posts_html = fetch_activity(session, slug, kind="posts")
+    result["_meta"]["fetch_status"]["posts"] = posts_status
+    if posts_status == 200 and posts_html:
+        result["posts"] = parse_activity(posts_html)
+
     # Education, Skills, Projects, Honors & Awards, Certifications, Languages, and
     # Recommendations are NOT reachable via the `/details/{section}/` page routes above
     # (confirmed dead end -- see docs/FINDINGS.md). They're served bundled together via
@@ -1071,13 +1104,6 @@ def extract_profile(profile_url, li_at, on_progress=None):
         lines = rsc.section_lines(sections["recommendationsTopLevelSection"])
         result["recommendations"] = _filter_generic_detail_lines(lines, "Recommendations")
         progress(f"Parsed Recommendations — {len(result['recommendations'])} entries")
-
-    _pace()
-    progress("Fetching recent posts…")
-    status, html = fetch_activity(session, slug, kind="posts")
-    result["_meta"]["fetch_status"]["posts"] = status
-    if status == 200 and html:
-        result["posts"] = parse_activity(html)
 
     elapsed = time.monotonic() - start_time
     _log(
