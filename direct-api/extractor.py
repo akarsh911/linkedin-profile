@@ -149,9 +149,15 @@ class LinkedInSession:
             if c.name == "JSESSIONID":
                 jsessionid = c.value
                 break
+        print(                                                                                                                                                                           
+            f"[csrf-debug] status={resp.status_code} final_url={resp.url} "                                                                                                              
+            f"redirects={[r.status_code for r in resp.history]} "                                                                                                                        
+            f"cookies={sorted(c.name for c in self.session.cookies)}",                                                                                                                   
+            file=sys.stderr,                                                                                                                                                             
+            )     
         if not jsessionid:
             return None
-        return jsessionid, jsessionid.strip('"')
+        return jsessionid, jsessionid.strip('"'Í)
 
     def post_component(self, slug, component_id, jsessionid_raw, csrf_token, timeout=15):
         """POST to `actions/component`, cookie + CSRF only -- no x-li-track or any other
