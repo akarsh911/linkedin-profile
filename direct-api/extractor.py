@@ -55,6 +55,23 @@ CONNECTION_DEGREE_RE = re.compile(r"^·?\s*(1st|2nd|3rd\+?)$")
 PRONOUN_RE = re.compile(r"^(He/Him|She/Her|They/Them)$")
 
 
+def _log(msg):
+    """Server-side diagnostic log -- always on, goes to stderr (shows up in uvicorn
+    logs). Separate from progress()/on_progress, which is the user-facing job status
+    surfaced to the frontend."""
+    print(f"[extractor {time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr)
+
+
+def _mask(secret, keep=4):
+    """Never log a credential in full -- see docs/FINDINGS.md process notes on prior
+    li_at leak incidents. Logs enough to correlate requests, not enough to reuse."""
+    if not secret:
+        return "(empty)"
+    if len(secret) <= keep:
+        return "*" * len(secret)
+    return f"{'*' * (len(secret) - keep)}{secret[-keep:]} (len={len(secret)})"
+
+
 # --------------------------------------------------------------------------- #
 # Auth / input resolution
 # --------------------------------------------------------------------------- #
@@ -105,6 +122,7 @@ class LinkedInSession:
 
     def __init__(self, li_at):
         self._li_at = li_at
+        self._jsessionid = None
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": USER_AGENT,
@@ -127,14 +145,32 @@ class LinkedInSession:
         # back to Latin-1 per RFC 2616 and mangles every multi-byte UTF-8 character
         # (e.g. "·" becomes "Â·"). The body is UTF-8 in practice -- force it.
         resp.encoding = "utf-8"
+        # Page routes (unlike a dedicated GET to /feed/, which came back with only
+        # edge/CDN cookies -- __cf_bm, bcookie, lidc -- and no JSESSIONID, per live
+        # debug capture) are confirmed to reach the real authenticated backend, so
+        # piggyback the CSRF-token cookie off whichever page route we already fetch
+        # rather than making a separate /feed/ request that doesn't reliably set it.
+        for c in self.session.cookies:
+            if c.name == "JSESSIONID":
+                self._jsessionid = c.value
+                break
+        _log(
+            f"GET {path} -> status={resp.status_code} "
+            f"cookies={sorted(c.name for c in self.session.cookies)}"
+        )
         return resp.status_code, resp.text if resp.status_code == 200 else None
 
     def get_csrf_token(self, timeout=15):
-        """Derive a csrf-token via the standard double-submit-cookie pattern: a
-        legitimate GET sets a real JSESSIONID cookie, and the CSRF header is just that
-        value with its surrounding quotes stripped. Confirmed (see docs/FINDINGS.md):
-        this plus the cookie is sufficient for `actions/component` -- no fingerprint
-        headers needed."""
+        """Derive a csrf-token via the standard double-submit-cookie pattern: the
+        CSRF header is just the JSESSIONID cookie value with its surrounding quotes
+        stripped. JSESSIONID is captured as a byproduct of get_html() page-route
+        requests (see there for why a dedicated /feed/ request is unreliable) --
+        this only falls back to a dedicated /feed/ request if no page route has
+        set one yet (e.g. if this is ever called before any get_html() call)."""
+        if self._jsessionid:
+            _log("CSRF token reused from a prior page-route request (no /feed/ hit needed)")
+            return self._jsessionid, self._jsessionid.strip('"')
+
         self.session.cookies.clear()
         self.session.cookies.set("li_at", self._li_at, domain=".linkedin.com")
         try:
@@ -149,14 +185,14 @@ class LinkedInSession:
             if c.name == "JSESSIONID":
                 jsessionid = c.value
                 break
-        print(                                                                                                                                                                           
-            f"[csrf-debug] status={resp.status_code} final_url={resp.url} "                                                                                                              
-            f"redirects={[r.status_code for r in resp.history]} "                                                                                                                        
-            f"cookies={sorted(c.name for c in self.session.cookies)}",                                                                                                                   
-            file=sys.stderr,                                                                                                                                                             
-            )     
+        _log(
+            f"CSRF fallback GET /feed/ -> status={resp.status_code} final_url={resp.url} "
+            f"redirects={[r.status_code for r in resp.history]} "
+            f"cookies={sorted(c.name for c in self.session.cookies)}"
+        )
         if not jsessionid:
             return None
+        self._jsessionid = jsessionid
         return jsessionid, jsessionid.strip('"')
 
     def post_component(self, slug, component_id, jsessionid_raw, csrf_token, timeout=15):
@@ -183,6 +219,7 @@ class LinkedInSession:
                 "Needs a fresh li_at cookie value -- see docs/FINDINGS.md."
             )
         resp.encoding = "utf-8"
+        _log(f"POST actions/component componentId={component_id} -> status={resp.status_code}")
         return resp.status_code, resp.text if resp.status_code == 200 else None
 
 
@@ -271,11 +308,13 @@ def fetch_bundled_sections(session, slug, profile_html, on_progress=None):
     fetch_status = {}
     if not csrf:
         progress("Could not derive a CSRF token — session may be dead")
+        _log(f"CSRF derivation failed for slug={slug} — no JSESSIONID from any page route or /feed/ fallback")
         return {}, {}, fetch_status
     jsessionid_raw, csrf_token = csrf
 
     component_ids = discover_component_ids(profile_html)
     progress(f"Discovered {len(component_ids)} profile component(s) to fetch")
+    _log(f"slug={slug}: discovered {len(component_ids)} component(s): {component_ids}")
     sections = {}
     section_logos = {}
     for cid in component_ids:
@@ -930,7 +969,9 @@ def extract_profile(profile_url, li_at, on_progress=None):
         if on_progress:
             on_progress(msg)
 
+    start_time = time.monotonic()
     slug = vanity_slug_from_url(profile_url)
+    _log(f"=== extraction start: profile_url={profile_url} slug={slug} li_at={_mask(li_at)} ===")
     session = LinkedInSession(li_at)
 
     result = {
@@ -964,8 +1005,10 @@ def extract_profile(profile_url, li_at, on_progress=None):
         result["profile"].update(top_card)
         result["profile"]["about"] = parse_about(soup)
         progress(f"Base profile fetched — {top_card.get('name') or slug}")
+        _log(f"slug={slug}: base profile OK, name={top_card.get('name')!r}")
     else:
         progress(f"Base profile fetch failed (HTTP {status})")
+        _log(f"slug={slug}: base profile FAILED, status={status}")
 
     _pace()
     progress("Fetching Experience…")
@@ -1036,6 +1079,16 @@ def extract_profile(profile_url, li_at, on_progress=None):
     if status == 200 and html:
         result["posts"] = parse_activity(html)
 
+    elapsed = time.monotonic() - start_time
+    _log(
+        f"=== extraction done: slug={slug} elapsed={elapsed:.1f}s "
+        f"profile={'ok' if result['profile']['name'] else 'MISSING'} "
+        f"experience={len(result['experience'])} education={len(result['education'])} "
+        f"skills={len(result['skills'])} projects={len(result['projects'])} "
+        f"honors={len(result['honors_awards'])} certifications={len(result['certifications'])} "
+        f"languages={len(result['languages'])} recommendations={len(result['recommendations'])} "
+        f"posts={len(result['posts'])} fetch_status={result['_meta']['fetch_status']} ==="
+    )
     progress("Done.")
     return result
 
