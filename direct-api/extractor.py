@@ -72,6 +72,32 @@ def _mask(secret, keep=4):
     return f"{'*' * (len(secret) - keep)}{secret[-keep:]} (len={len(secret)})"
 
 
+# Hardcoded rather than env-configured since this is single-operator (only you get
+# these pushes). A short random suffix is appended since an ntfy.sh topic name is the
+# only "auth" it has -- anyone who guesses/knows it can read (and post to) it too.
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "akarsh-tross-linkedin-7q2m")
+
+
+def _notify(title, message, priority="default", tags=None):
+    """Push a phone notification via ntfy.sh -- set NTFY_TOPIC to enable (no-op
+    otherwise). Best-effort: a notification failure must never break extraction."""
+    if not NTFY_TOPIC:
+        return
+    try:
+        requests.post(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data=message.encode("utf-8"),
+            headers={
+                "Title": title,
+                "Priority": priority,
+                **({"Tags": ",".join(tags)} if tags else {}),
+            },
+            timeout=5,
+        )
+    except requests.exceptions.RequestException as e:
+        _log(f"ntfy notification failed: {e}")
+
+
 # --------------------------------------------------------------------------- #
 # Auth / input resolution
 # --------------------------------------------------------------------------- #
@@ -329,6 +355,13 @@ def fetch_bundled_sections(session, slug, profile_html, on_progress=None):
     if not csrf:
         progress("Could not derive a CSRF token — session may be dead")
         _log(f"CSRF derivation failed for slug={slug} — no JSESSIONID from any page route or /feed/ fallback")
+        _notify(
+            "LinkedIn CSRF derivation failed",
+            f"slug={slug}: no JSESSIONID from any page route or the /feed/ fallback. "
+            "Education/Skills/Projects/etc. will be empty this run.",
+            priority="urgent",
+            tags=["warning"],
+        )
         return {}, {}, fetch_status
     jsessionid_raw, csrf_token = csrf
 
@@ -992,6 +1025,7 @@ def extract_profile(profile_url, li_at, on_progress=None):
     start_time = time.monotonic()
     slug = vanity_slug_from_url(profile_url)
     _log(f"=== extraction start: profile_url={profile_url} slug={slug} li_at={_mask(li_at)} ===")
+    _notify("LinkedIn fetch attempt", f"Fetching {profile_url}", tags=["mag"])
     session = LinkedInSession(li_at)
 
     result = {
@@ -1017,103 +1051,128 @@ def extract_profile(profile_url, li_at, on_progress=None):
         "_meta": {"fetch_status": {}},
     }
 
-    progress("Fetching base profile…")
-    status, profile_html = fetch_section(session, slug, section=None)
-    result["_meta"]["fetch_status"]["profile"] = status
-    if status == 200 and profile_html:
-        top_card, soup = parse_top_card(profile_html)
-        result["profile"].update(top_card)
-        result["profile"]["about"] = parse_about(soup)
-        progress(f"Base profile fetched — {top_card.get('name') or slug}")
-        _log(f"slug={slug}: base profile OK, name={top_card.get('name')!r}")
-    else:
-        progress(f"Base profile fetch failed (HTTP {status})")
-        _log(f"slug={slug}: base profile FAILED, status={status}")
+    try:
+        progress("Fetching base profile…")
+        status, profile_html = fetch_section(session, slug, section=None)
+        result["_meta"]["fetch_status"]["profile"] = status
+        if status == 200 and profile_html:
+            top_card, soup = parse_top_card(profile_html)
+            result["profile"].update(top_card)
+            result["profile"]["about"] = parse_about(soup)
+            progress(f"Base profile fetched — {top_card.get('name') or slug}")
+            _log(f"slug={slug}: base profile OK, name={top_card.get('name')!r}")
+        else:
+            progress(f"Base profile fetch failed (HTTP {status})")
+            _log(f"slug={slug}: base profile FAILED, status={status}")
+            _notify(
+                "LinkedIn li_at may be dead",
+                f"Base profile fetch for {profile_url} returned HTTP {status} (expected 200).",
+                priority="urgent",
+                tags=["warning", "closed_lock_with_key"],
+            )
 
-    _pace()
-    progress("Fetching Experience…")
-    status, html = fetch_section(session, slug, section="experience")
-    result["_meta"]["fetch_status"]["experience"] = status
-    if status == 200 and html:
-        result["experience"] = parse_experience(html)
-        progress(f"Experience — {len(result['experience'])} entries")
-    else:
-        progress(f"Experience fetch failed (HTTP {status})")
+        _pace()
+        progress("Fetching Experience…")
+        status, html = fetch_section(session, slug, section="experience")
+        result["_meta"]["fetch_status"]["experience"] = status
+        if status == 200 and html:
+            result["experience"] = parse_experience(html)
+            progress(f"Experience — {len(result['experience'])} entries")
+        else:
+            progress(f"Experience fetch failed (HTTP {status})")
 
-    # Fetch recent posts BEFORE the bundled-sections/CSRF step below. Live debug capture
-    # (see docs/FINDINGS.md) showed /in/{slug}/ and /in/{slug}/details/experience/ never
-    # set a JSESSIONID cookie, but /in/{slug}/recent-activity/shares/ reliably does --
-    # so this needs to run first to have a JSESSIONID ready for get_csrf_token() to reuse
-    # (see LinkedInSession.get_html/get_csrf_token) instead of falling back to the
-    # unreliable dedicated /feed/ request.
-    _pace()
-    progress("Fetching recent posts…")
-    posts_status, posts_html = fetch_activity(session, slug, kind="posts")
-    result["_meta"]["fetch_status"]["posts"] = posts_status
-    if posts_status == 200 and posts_html:
-        result["posts"] = parse_activity(posts_html)
+        # Fetch recent posts BEFORE the bundled-sections/CSRF step below. Live debug
+        # capture (see docs/FINDINGS.md) showed /in/{slug}/ and
+        # /in/{slug}/details/experience/ never set a JSESSIONID cookie, but
+        # /in/{slug}/recent-activity/shares/ reliably does -- so this needs to run
+        # first to have a JSESSIONID ready for get_csrf_token() to reuse (see
+        # LinkedInSession.get_html/get_csrf_token) instead of falling back to the
+        # unreliable dedicated /feed/ request.
+        _pace()
+        progress("Fetching recent posts…")
+        posts_status, posts_html = fetch_activity(session, slug, kind="posts")
+        result["_meta"]["fetch_status"]["posts"] = posts_status
+        if posts_status == 200 and posts_html:
+            result["posts"] = parse_activity(posts_html)
 
-    # Education, Skills, Projects, Honors & Awards, Certifications, Languages, and
-    # Recommendations are NOT reachable via the `/details/{section}/` page routes above
-    # (confirmed dead end -- see docs/FINDINGS.md). They're served bundled together via
-    # `actions/component`, discovered per-profile since which sections bundle under which
-    # componentId varies profile to profile. Confirmed reachable with cookie + CSRF only,
-    # no fingerprint headers -- see docs/FINDINGS.md "Correction + new lead".
-    sections, section_logos, component_fetch_status = ({}, {}, {})
-    if status == 200 and profile_html:
-        sections, section_logos, component_fetch_status = fetch_bundled_sections(
-            session, slug, profile_html, on_progress=progress
+        # Education, Skills, Projects, Honors & Awards, Certifications, Languages, and
+        # Recommendations are NOT reachable via the `/details/{section}/` page routes
+        # above (confirmed dead end -- see docs/FINDINGS.md). They're served bundled
+        # together via `actions/component`, discovered per-profile since which
+        # sections bundle under which componentId varies profile to profile.
+        # Confirmed reachable with cookie + CSRF only, no fingerprint headers -- see
+        # docs/FINDINGS.md "Correction + new lead".
+        sections, section_logos, component_fetch_status = ({}, {}, {})
+        if status == 200 and profile_html:
+            sections, section_logos, component_fetch_status = fetch_bundled_sections(
+                session, slug, profile_html, on_progress=progress
+            )
+        result["_meta"]["fetch_status"].update({f"component:{k}": v for k, v in component_fetch_status.items()})
+
+        if "educationTopLevelSection" in sections:
+            lines = _strip_heading(rsc.section_lines(sections["educationTopLevelSection"]), "Education")
+            result["education"] = _group_education(lines, section_logos.get("educationTopLevelSection"))
+            progress(f"Parsed Education — {len(result['education'])} entries")
+
+        if "skillsSection" in sections:
+            item_lines = rsc.collection_item_lines(sections["skillsSection"])
+            if not item_lines:
+                # Short skill lists aren't always wrapped in an initialItems collection
+                # -- fall back to per-skill componentKey boundaries (see rsc.py).
+                item_lines = rsc.component_item_lines(sections["skillsSection"], "com.linkedin.sdui.profile.skill(")
+            result["skills"] = _group_skills_from_items(item_lines)
+            progress(f"Parsed Skills — {len(result['skills'])} entries")
+
+        if "projectsSection" in sections:
+            lines = _strip_heading(rsc.section_lines(sections["projectsSection"]), "Projects")
+            result["projects"] = _group_projects(lines, section_logos.get("projectsSection"))
+            progress(f"Parsed Projects — {len(result['projects'])} entries")
+
+        if "honorsSection" in sections:
+            lines = _strip_heading(rsc.section_lines(sections["honorsSection"]), "Honors & awards")
+            result["honors_awards"] = _group_honors(lines)
+            progress(f"Parsed Honors & Awards — {len(result['honors_awards'])} entries")
+
+        if "certificationTopLevelSection" in sections:
+            lines = rsc.section_lines(sections["certificationTopLevelSection"])
+            result["certifications"] = _filter_generic_detail_lines(lines, "Licenses & certifications")
+            progress(f"Parsed Certifications — {len(result['certifications'])} entries")
+
+        if "languageTopLevelSection" in sections:
+            lines = rsc.section_lines(sections["languageTopLevelSection"])
+            result["languages"] = _filter_generic_detail_lines(lines, "Languages")
+            progress(f"Parsed Languages — {len(result['languages'])} entries")
+
+        if "recommendationsTopLevelSection" in sections:
+            lines = rsc.section_lines(sections["recommendationsTopLevelSection"])
+            result["recommendations"] = _filter_generic_detail_lines(lines, "Recommendations")
+            progress(f"Parsed Recommendations — {len(result['recommendations'])} entries")
+    except LinkedInSessionRevokedError as e:
+        _log(f"slug={slug}: li_at session revoked mid-extraction: {e}")
+        _notify(
+            "LinkedIn li_at expired",
+            f"Session revoked while fetching {profile_url}\n{e}",
+            priority="urgent",
+            tags=["warning", "closed_lock_with_key"],
         )
-    result["_meta"]["fetch_status"].update({f"component:{k}": v for k, v in component_fetch_status.items()})
-
-    if "educationTopLevelSection" in sections:
-        lines = _strip_heading(rsc.section_lines(sections["educationTopLevelSection"]), "Education")
-        result["education"] = _group_education(lines, section_logos.get("educationTopLevelSection"))
-        progress(f"Parsed Education — {len(result['education'])} entries")
-
-    if "skillsSection" in sections:
-        item_lines = rsc.collection_item_lines(sections["skillsSection"])
-        if not item_lines:
-            # Short skill lists aren't always wrapped in an initialItems collection --
-            # fall back to per-skill componentKey boundaries (see rsc.py).
-            item_lines = rsc.component_item_lines(sections["skillsSection"], "com.linkedin.sdui.profile.skill(")
-        result["skills"] = _group_skills_from_items(item_lines)
-        progress(f"Parsed Skills — {len(result['skills'])} entries")
-
-    if "projectsSection" in sections:
-        lines = _strip_heading(rsc.section_lines(sections["projectsSection"]), "Projects")
-        result["projects"] = _group_projects(lines, section_logos.get("projectsSection"))
-        progress(f"Parsed Projects — {len(result['projects'])} entries")
-
-    if "honorsSection" in sections:
-        lines = _strip_heading(rsc.section_lines(sections["honorsSection"]), "Honors & awards")
-        result["honors_awards"] = _group_honors(lines)
-        progress(f"Parsed Honors & Awards — {len(result['honors_awards'])} entries")
-
-    if "certificationTopLevelSection" in sections:
-        lines = rsc.section_lines(sections["certificationTopLevelSection"])
-        result["certifications"] = _filter_generic_detail_lines(lines, "Licenses & certifications")
-        progress(f"Parsed Certifications — {len(result['certifications'])} entries")
-
-    if "languageTopLevelSection" in sections:
-        lines = rsc.section_lines(sections["languageTopLevelSection"])
-        result["languages"] = _filter_generic_detail_lines(lines, "Languages")
-        progress(f"Parsed Languages — {len(result['languages'])} entries")
-
-    if "recommendationsTopLevelSection" in sections:
-        lines = rsc.section_lines(sections["recommendationsTopLevelSection"])
-        result["recommendations"] = _filter_generic_detail_lines(lines, "Recommendations")
-        progress(f"Parsed Recommendations — {len(result['recommendations'])} entries")
+        raise
 
     elapsed = time.monotonic() - start_time
-    _log(
-        f"=== extraction done: slug={slug} elapsed={elapsed:.1f}s "
+    summary = (
+        f"slug={slug} elapsed={elapsed:.1f}s "
         f"profile={'ok' if result['profile']['name'] else 'MISSING'} "
         f"experience={len(result['experience'])} education={len(result['education'])} "
         f"skills={len(result['skills'])} projects={len(result['projects'])} "
         f"honors={len(result['honors_awards'])} certifications={len(result['certifications'])} "
         f"languages={len(result['languages'])} recommendations={len(result['recommendations'])} "
-        f"posts={len(result['posts'])} fetch_status={result['_meta']['fetch_status']} ==="
+        f"posts={len(result['posts'])} fetch_status={result['_meta']['fetch_status']}"
+    )
+    _log(f"=== extraction done: {summary} ===")
+    _notify(
+        "LinkedIn fetch complete" if result["profile"]["name"] else "LinkedIn fetch finished (no profile data)",
+        f"{result['profile']['name'] or profile_url}\n{summary}",
+        priority="default" if result["profile"]["name"] else "high",
+        tags=["white_check_mark"] if result["profile"]["name"] else ["warning"],
     )
     progress("Done.")
     return result
