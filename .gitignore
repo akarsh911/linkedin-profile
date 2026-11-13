@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 /tmp/
 playwright-scraper/.browser_profile/
+.venv/
+output/

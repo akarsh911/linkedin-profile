@@ -44,7 +44,7 @@ modeled — this was corrected mid-investigation (see "Correction" below):
 | Languages | ⚪ Unclear — no content, no explicit empty-state message either | Lower confidence than the others; not fully resolved |
 | Full ("+N more") skill lists per entry | ❌ Blocked (via the `pagination`-based overlay path tested so far) | Worth retesting via `component` given the reversal above — not yet done |
 | Company/school logo URLs | ⚪ Mixed — absent from the Experience response, present in this Education response | `_extract_logo_urls_in_order()` already handles the format when present |
-| Posts / activity | ❌ Broken | `/recent-activity/shares/` doesn't resolve correctly (generic title, no `<main>`); not solved, not guessed further |
+| Posts / activity | ✅ Works — latest N posts (text, URL, exact timestamp), cookie + CSRF only | The `/recent-activity/shares/` page is an empty shell, but the `profileCardsActivity` `actions/component` call carries the posts — see "Posts / recent activity: solved" below |
 
 **Correction: "blocked" was not a closed question — it was specific to one action.**
 The original three-test closure (below) was real and correct *for `pagination`*, but was
@@ -160,7 +160,67 @@ container) — but the test profile had no populated entries in any of them, so 
 "confirmed working" was actually a false signal (see below).
 
 `/recent-activity/shares/` (posts) does not work as expected: generic `<title>LinkedIn</title>`,
-no `<main>` element. Flagged as a known gap, not solved.
+no `<main>` element. Flagged as a known gap, not solved. **(Superseded — solved via
+`actions/component`; see "Posts / recent activity: solved" below.)**
+
+## Posts / recent activity: solved
+
+**Short version:** posts are not on any page route. They come from the same
+`actions/component` endpoint that serves Education/Skills/etc., using the component the
+profile page already references as `profileCardsActivity` — which `discover_component_ids()`
+had been deliberately skipping (along with `profileCardsAboveActivity` and
+`profileCardsExperienceOnly`, which are the top card / experience that are fetched
+separately).
+
+**What was tried and what each showed** (live, real account, one profile, 2026-11-14):
+
+| Attempt | Result |
+|---|---|
+| `GET /in/{slug}/recent-activity/shares/` | `200`, ~1.4 MB, but `<title>LinkedIn`, no `<main>`, no `data-view-name` markers, zero `urn:li:activity` / `ugcPost` URNs, zero componentIds. A hydration shell: the post list is loaded client-side after render, so there is nothing to parse. This is why the original `parse_activity()` returned `[]` for every profile. |
+| `GET /in/{slug}/` (already fetched for the base profile) | The HTML references the componentId `com.linkedin.sdui.generated.profile.dsl.impl.profileCardsActivity` alongside the `...BelowActivityPart{1..7}` ones. |
+| `POST actions/component` with `componentId=...profileCardsActivity` (cookie + CSRF only, same as the other sections) | `200`, ~5 MB RSC response. The `activitySection` subtree itself is only the "Activity / N followers" header and the Posts/Comments/Images tab shell (the tabs carry a `ServerRequest` named `loadMainProfileActivityPosts` — not needed), but the **post cards themselves are separate top-level entries in the response table**, 10 of them for the test profile. |
+
+**How a post card is identified.** Each card is a top-level table entry containing exactly
+one `/feed/update/urn:li:activity:<id>/` link. The same activity ID shows up in several
+entries (wrapper, sub-blocks, reaction-state keys), so the extractor keeps, per ID, the
+entry with the most visible text — that is the card.
+
+**How text is extracted.** `rsc.walk_text()` follows only a fixed set of keys and finds
+nothing in these cards, so `parse_recent_posts()` has its own walker: string leaves that
+are list items or `children` entries, minus HTML tag names, `text-attr-*` markers, class
+names (`jkf…`), `proto.*` types, URLs/URNs, bare numbers and UUIDs, and skipping
+`className` / `viewTrackingSpecs` / `tracking` / `triggers` / `action` subtrees. Verified
+against three real posts: plain paragraphs, a post with `@mentions` (each mention is its
+own text leaf, so it appears on its own line), and a post with hashtags.
+
+**Dates come from the ID, not the page.** The response only has relative times ("2mo").
+LinkedIn activity IDs are snowflake-style: `id >> 22` is a millisecond Unix timestamp.
+Decoding the newest post's ID gave a date two days before the run, and that post's text
+referred to an event two days later, so the decoded date is plausible (not cross-checked
+against LinkedIn's own displayed date). IDs also sort newest-first, which is how "the latest N" is chosen.
+
+**Known limits.**
+- No reaction / comment / repost counts — not reliably present in this response.
+- Text only: images, videos, polls and article cards contribute at most their caption.
+- Only what the Activity card initially renders (~10 posts on the test profile); "latest N"
+  is capped by that, not by an explicit page size. Reshares of other people's posts appear
+  with the original author's text.
+- The Activity card is the "Posts" tab; Comments and Images tabs are not fetched.
+- Validated against three real profiles (3 posts each, all `200`). Markup differences for
+  rarely-used post types (documents, events) are untested.
+
+**Also learned along the way:**
+- The API/CLI reads `LI_AT` from the environment only; it does not load `.env` itself
+  (Docker Compose does, via `env_file`). Running `uvicorn` locally with just a populated
+  `.env` returns `503 Server misconfigured` — `export` the variable first
+  (`set -a; . ./.env; set +a`).
+- Removing the `/recent-activity/shares/` request also saves one request per profile. The
+  JSESSIONID needed for CSRF is set by the plain `/in/{slug}/` fetch (confirmed in the
+  cookie jar after that request), and `get_csrf_token()` still probes other routes as a
+  fallback.
+- A session was revoked (`TooManyRedirects` redirect loop → 503) on the *third* profile
+  fetched back-to-back at the default pacing. Spacing profile runs a couple of minutes
+  apart avoided it afterwards; a fresh `li_at` was required to recover.
 
 ## Education: the real investigation
 
