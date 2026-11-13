@@ -19,9 +19,10 @@ Confidence levels per section (see README.md in this folder for detail):
   - education / skills / certifications / languages / projects : LOW (same URL pattern as
     experience is assumed but NOT individually confirmed; parser is a generic best-effort
     fallback and may return incomplete/empty results).
-  - activity / posts                                          : LOW (different URL family
-    entirely -- `/recent-activity/...` -- not tested in this session at all; included as
-    a best-effort attempt, expect it to need real debugging against actual output).
+  - activity / posts                                          : MEDIUM (read from the
+    `profileCardsActivity` component, not the `/recent-activity/` page, which is an empty
+    shell -- see docs/FINDINGS.md "Posts / recent activity: solved". Text, URL and exact
+    timestamp only; no reaction/comment counts.)
 """
 
 import argparse
@@ -964,36 +965,88 @@ def _filter_generic_detail_lines(lines, section_name):
 # session at all. Best-effort generic block extraction only.
 # --------------------------------------------------------------------------- #
 
-def parse_activity(html):
-    soup = BeautifulSoup(html, "lxml")
-    main = soup.find("main") or soup.find(attrs={"aria-label": "Primary content"}) or soup
+_ACTIVITY_URN_RE = re.compile(r"/feed/update/(urn:li:activity:(\d+))")
+_POST_NOISE = {"span", "strong", "div", "p", "a", "br", "em", "b", "i", "ul", "li", "$", "null", "default", "Post"}
+_POST_SKIP_KEYS = {"className", "viewTrackingSpecs", "tracking", "customVars", "triggers", "action"}
+_DEFAULT_POST_LIMIT = 3
+
+
+def _post_text_lines(node):
+    """Visible text leaves of one resolved post card, in document order."""
+    out = []
+
+    def walk(n, last, depth=0):
+        if depth > 70:
+            return
+        if isinstance(n, str):
+            s = n.strip()
+            if ((last.isdigit() or last == "children") and s and s not in _POST_NOISE
+                    and not s.isdigit()
+                    and not s.startswith(("$", "text-attr", "proto.", "jkf", "http", "/", "urn:"))
+                    and not re.fullmatch(r"[0-9a-f-]{20,}", s)):
+                out.append(s)
+        elif isinstance(n, dict):
+            for k, v in n.items():
+                if k not in _POST_SKIP_KEYS:
+                    walk(v, str(k), depth + 1)
+        elif isinstance(n, list):
+            for i, v in enumerate(n):
+                walk(v, str(i), depth + 1)
+
+    walk(node, "")
+    return out
+
+
+def parse_recent_posts(component_body, limit=_DEFAULT_POST_LIMIT):
+    """Parse the `profileCardsActivity` component response into the newest `limit` posts.
+    Each post card is a top-level entry in the response table that links to exactly one
+    `/feed/update/urn:li:activity:<id>/`. The same activity appears in several table
+    entries (wrappers, sub-blocks); the one with the most text is the card itself.
+    LinkedIn activity IDs are snowflake-style -- the top bits are a millisecond
+    timestamp -- so IDs sort newest-first and give the exact post date."""
+    table = rsc.parse_table(component_body)
+    best = {}
+    for key, val in table.items():
+        urns = set(_ACTIVITY_URN_RE.findall(json.dumps(val)))
+        if len(urns) != 1:
+            continue
+        urn, act_id = urns.pop()
+        try:
+            lines = _post_text_lines(rsc.resolve(val, table))
+        except Exception:
+            continue
+        if len("".join(lines)) > len("".join(best.get(urn, ("", 0, []))[2])):
+            best[urn] = (urn, int(act_id), lines)
 
     posts = []
-    # Try common LinkedIn post-container markers first; fall back to a generic
-    # "list item" scan if none match -- this is a guess at structure, not a
-    # confirmed selector, and should be the first thing fixed once real HTML
-    # from this route is inspected.
-    candidates = main.find_all(attrs={"data-view-name": True})
-    seen_texts = set()
-    for el in candidates:
-        dv = el.get("data-view-name", "")
-        if "feed" in dv.lower() or "post" in dv.lower() or "update" in dv.lower():
-            text = el.get_text(" ", strip=True)
-            if text and text not in seen_texts and len(text) > 20:
-                seen_texts.add(text)
-                posts.append({"text": text, "source_marker": dv})
-
-    if not posts:
-        # Fallback: just return distinct paragraph-length text blocks from <main>,
-        # deduplicated -- unstructured, but better than nothing until this route's
-        # real markup is inspected and this function is rewritten against it.
-        for el in main.find_all(["p", "span", "div"]):
-            text = el.get_text(" ", strip=True)
-            if text and len(text) > 40 and text not in seen_texts:
-                seen_texts.add(text)
-                posts.append({"text": text, "source_marker": None})
-
+    for urn, act_id, lines in sorted(best.values(), key=lambda x: x[1], reverse=True)[:limit]:
+        ts = (act_id >> 22) / 1000.0
+        posts.append({
+            "url": f"https://www.linkedin.com/feed/update/{urn}/",
+            "activity_id": urn,
+            "posted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
+            "text": "\n".join(lines),
+        })
     return posts
+
+
+def fetch_recent_posts(session, slug, profile_html, limit=_DEFAULT_POST_LIMIT):
+    """Fetch the profile's Activity card via `actions/component` (the /recent-activity/
+    page is an empty hydration shell, so posts can't come from there). Returns
+    (http_status, posts)."""
+    component_id = next(
+        (c for c in COMPONENT_ID_RE.findall(profile_html) if c.endswith(".profileCardsActivity")), None
+    )
+    if not component_id:
+        return None, []
+    csrf = session.get_csrf_token(slug=slug)
+    if not csrf:
+        return None, []
+    status, body = session.post_component(slug, component_id, csrf[0], csrf[1])
+    _maybe_dump("component_profileCardsActivity", body)
+    if status == 200 and body:
+        return status, parse_recent_posts(body, limit)
+    return status, []
 
 
 # --------------------------------------------------------------------------- #
@@ -1014,7 +1067,7 @@ def _pace():
         time.sleep(REQUEST_DELAY_SECONDS)
 
 
-def extract_profile(profile_url, li_at, on_progress=None):
+def extract_profile(profile_url, li_at, on_progress=None, post_limit=_DEFAULT_POST_LIMIT):
     """on_progress(message: str), if given, is called at each meaningful checkpoint --
     used by api.py's async job endpoint to surface a live progress log to the frontend
     while a cold (uncached) fetch is in flight."""
@@ -1081,20 +1134,6 @@ def extract_profile(profile_url, li_at, on_progress=None):
         else:
             progress(f"Experience fetch failed (HTTP {status})")
 
-        # Fetch recent posts BEFORE the bundled-sections/CSRF step below. Live debug
-        # capture (see docs/FINDINGS.md) showed /in/{slug}/ and
-        # /in/{slug}/details/experience/ never set a JSESSIONID cookie, but
-        # /in/{slug}/recent-activity/shares/ reliably does -- so this needs to run
-        # first to have a JSESSIONID ready for get_csrf_token() to reuse (see
-        # LinkedInSession.get_html/get_csrf_token) instead of falling back to the
-        # unreliable dedicated /feed/ request.
-        _pace()
-        progress("Fetching recent posts…")
-        posts_status, posts_html = fetch_activity(session, slug, kind="posts")
-        result["_meta"]["fetch_status"]["posts"] = posts_status
-        if posts_status == 200 and posts_html:
-            result["posts"] = parse_activity(posts_html)
-
         # Education, Skills, Projects, Honors & Awards, Certifications, Languages, and
         # Recommendations are NOT reachable via the `/details/{section}/` page routes
         # above (confirmed dead end -- see docs/FINDINGS.md). They're served bundled
@@ -1108,6 +1147,14 @@ def extract_profile(profile_url, li_at, on_progress=None):
                 session, slug, profile_html, on_progress=progress
             )
         result["_meta"]["fetch_status"].update({f"component:{k}": v for k, v in component_fetch_status.items()})
+
+        if status == 200 and profile_html:
+            _pace()
+            progress("Fetching recent posts…")
+            posts_status, posts = fetch_recent_posts(session, slug, profile_html, limit=post_limit)
+            result["_meta"]["fetch_status"]["posts"] = posts_status
+            result["posts"] = posts
+            progress(f"Posts — {len(posts)} fetched")
 
         if "educationTopLevelSection" in sections:
             lines = _strip_heading(rsc.section_lines(sections["educationTopLevelSection"]), "Education")
@@ -1183,10 +1230,12 @@ def main():
     parser.add_argument("profile_url", help="e.g. https://www.linkedin.com/in/satyanadella/")
     parser.add_argument("--li-at", dest="li_at", default=None,
                          help="li_at cookie value (prefer LI_AT env var instead)")
+    parser.add_argument("--posts", type=int, default=_DEFAULT_POST_LIMIT,
+                         help="how many of the latest posts to include (default 3)")
     args = parser.parse_args()
 
     li_at = get_li_at(args.li_at)
-    result = extract_profile(args.profile_url, li_at)
+    result = extract_profile(args.profile_url, li_at, post_limit=args.posts)
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 

@@ -84,7 +84,7 @@ Open **http://localhost:9001/** (also served on `:9002` — same app, two ports)
 ```bash
 cd direct-api
 pip install -r requirements.txt
-export LI_AT="your_li_at_value_here"      # see "Auth" below
+export LI_AT="your_li_at_value_here"      # see "Auth" below (the app reads the env var, not .env)
 uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
@@ -126,6 +126,7 @@ never committed (see `.gitignore`).
   "skills": [ { "name": "...", "details": ["..."] } ],
   "projects": [ { "name": "...", "description": "...", "thumbnail_url": "..." } ],
   "honors_awards": [ { "title": "...", "issuer": "...", "date": "..." } ],
+  "posts": [ { "url": "...", "activity_id": "urn:li:activity:...", "posted_at": "2026-11-12T12:59:55Z", "text": "..." } ],
   "certifications": [], "languages": [], "recommendations": [],
   "_meta": { "fetch_status": { "profile": 200, "experience": 200, "...": "..." } }
 }
@@ -150,8 +151,11 @@ Requests are rate-limited (10/minute/IP by default) and cached in memory per pro
   report when a profile genuinely has none — but we haven't yet validated them against a
   profile that actually has populated data in those specific sections, so treat them as
   "should work" rather than "proven" until confirmed against a real example.
-- **Posts/recent activity** were investigated and the routes tried didn't resolve
-  correctly — not included in the output rather than returning something unreliable.
+- **Posts** returns the latest 3 posts (URL, activity ID, exact UTC timestamp decoded from
+  the ID, and text), read from the profile's Activity component — the `/recent-activity/`
+  page itself is an empty shell. No reaction/comment counts, and non-text content
+  (images, polls, article cards) is limited to its caption. From the CLI,
+  `python extractor.py <url> --posts N` changes the count.
 - **The session cookie can expire or get revoked** by LinkedIn independent of anything
   this service does; the API returns a clear `503` when that happens rather than a
   confusing failure, but recovering it currently needs a human to supply a fresh `li_at`.
